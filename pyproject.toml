@@ -1,0 +1,46 @@
+[project]
+name = "tencent-server-seckill"
+version = "0.1.0"
+readme = "README.md"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    "colorama>=0.4.6",
+    "playwright>=1.40",
+]
+
+[project.scripts]
+tencent-server-seckill = "tencent_server_seckill.menu:main"
+tencent-server-seckill-cli = "tencent_server_seckill.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright[nodejs]",
+    "ruff",
+    "types-colorama",
+]
+
+[tool.uv.build-backend]
+source-include = [
+    ".gitignore",
+    "main.py",
+    "start.ps1",
+    "uv.lock",
+    "腾讯云服务器抢购助手.bat",
+]
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["_verify"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.pyright]
+include = ["src", "main.py"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
