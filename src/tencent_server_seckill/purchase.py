@@ -220,7 +220,10 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
             seen_codes[code] = cnt
             if isinstance(code, str) and code not in ("undefined", "null"):
                 # NOT-LOGINED 之类：接口根本没走到抢购逻辑，继续发没意义
-                desc = "不是抢购结果码，登录态可能失效了"
+                if "CSRF" in code.upper():
+                    desc = "CSRF 校验失败：token 与服务端当前 skey 对不上"
+                else:
+                    desc = "不是抢购结果码，登录态可能失效了"
             else:
                 desc = CODE_DESC.get(code, "未识别的返回码，程序会继续；请附服务器原话发 issue")
             log(f"  返回 {code}: {desc} | {msgs.get(key, '')}")
@@ -273,7 +276,10 @@ async def rapid_purchase(page, goods, duration=None, open_in=None, regions=None,
             break
 
         if bad_code is not None:
-            log("  本场停止，重新扫码登录再来。")
+            if "CSRF" in str(bad_code).upper():
+                log("  本场停止：CSRF 校验失败，token 与服务端当前 skey 对不上，请重新扫码再来。")
+            else:
+                log("  本场停止，重新扫码登录再来。")
             last_code = bad_code
             break
 

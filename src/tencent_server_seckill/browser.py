@@ -14,8 +14,66 @@ except ImportError:
     print("缺少 playwright，请执行 uv sync --locked --no-dev")
     sys.exit(1)
 
+try:
+    from playwright_stealth import Stealth
+except ImportError:  # 没装 stealth 也能跑，只是少了反检测脚本
+    Stealth = None
+
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+# 反检测：playwright-stealth（第三方）把 puppeteer-extra 的 evasion 脚本搬进
+# Playwright。以前只手工盖了 navigator.webdriver 一条，现在换成整套：启动参数
+# （--disable-blink-features=AutomationControlled、--accept-lang）、请求头
+# sec-ch-ua、以及 plugins / languages / webgl / permissions 等指纹。
+#
+# UA 一律用上面这个常量：stealth 的 navigator.userAgent 覆盖、HTTP 的
+# User-Agent 头、sec-ch-ua 三处必须一致，不一致本身就是破绽。
+#
+# 【注意】stealth 是页面级脚本，只有真的打开页面才会跑。
+# 只用 ctx.request.post 打接口的那条路（校验 / 试单）没有页面，脚本永远不执行，
+# 那条路靠的是正确的 csrf token + 与页面一致的 UA / sec-ch-ua 请求头
+# （sec-ch-ua 由 stealth 挂在 context 的 extra_http_headers 上，ctx.request
+#   会带上，已实测）。
+STEALTH = (
+    Stealth(navigator_user_agent_override=UA, navigator_languages_override=("zh-CN", "zh"))
+    if Stealth
+    else None
+)
+
+
+def hook_stealth(pw):
+    """把 stealth 挂到 playwright 对象上。
+
+    挂上之后：launch 会自动补 stealth 需要的启动参数，browser.new_context /
+    new_page 会自动注入 evasion 脚本。同一个 pw 只挂一次（重复挂会重复改
+    启动参数）。
+    """
+    if STEALTH is None:
+        return False
+    if getattr(pw, "_stealth_hooked", False):
+        return True
+    try:
+        STEALTH.hook_playwright_context(pw)
+        setattr(pw, "_stealth_hooked", True)
+        return True
+    except Exception as e:
+        log(f"stealth 挂载失败（不影响功能）: {str(e)[:80]}")
+        return False
+
+
+async def apply_stealth(target):
+    """给 context / page 注入 stealth 脚本。已经注入过就跳过，不重复加。"""
+    if STEALTH is None:
+        return False
+    if getattr(target, "_playwright_stealth_applied", False):
+        return True
+    try:
+        await STEALTH.apply_stealth_async(target)
+        return True
+    except Exception as e:
+        log(f"stealth 注入失败（不影响功能）: {str(e)[:80]}")
+        return False
 
 
 # 启动顺序：先用本机的，都没装就回落到 playwright 下载的 chromium
@@ -46,6 +104,7 @@ def ensure_chromium() -> None:
 
 async def launch_browser(pw, headless=True, extra_args=None):
     """按 BROWSER_CHANNELS 顺序试，谁能起就用谁。"""
+    hook_stealth(pw)
     args = LAUNCH_ARGS + list(extra_args or [])
     last = None
 
@@ -69,11 +128,14 @@ async def launch_browser(pw, headless=True, extra_args=None):
 async def new_api_context(browser: Browser, storage_state: Path) -> BrowserContext:
     """Apply the Windows proxy selected for requests to the activity API."""
     server = os.environ.get("TENCENT_SECKILL_API_PROXY")
-    return await browser.new_context(
+    ctx = await browser.new_context(
         storage_state=storage_state,
         user_agent=UA,
+        extra_http_headers={"accept-language": "zh-CN,zh"},
         proxy={"server": server} if server else None,
     )
+    await apply_stealth(ctx)
+    return ctx
 
 
 # 前端的 x-csrf-token 是动态生成的，得 hook 住 fetch/XHR 才能拿到。

@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 # ============================================================
 # 配置
 # ============================================================
@@ -9,6 +11,10 @@ ACTIVITY_URL = "https://cloud.tencent.com/act/pro/double11-202611"
 # API 地址
 API_BASE = "https://act-api.cloud.tencent.com"
 DO_GOODS_URL = API_BASE + "/dianshi/do-goods"
+# API 主机名：算 csrf token 时只认「浏览器真的会发到这个主机」的 cookie。
+# .state.json 里同时躺着 .qcloud.com / .cloud.tencent.cn / .cloud.tencent.com
+# 三条 skey，只有 .cloud.tencent.com 那条会发到 act-api.cloud.tencent.com。
+API_HOST = urlsplit(API_BASE).hostname or "act-api.cloud.tencent.com"
 # 只读查库存/资格。实测 2026-11-10 22:11（登录态）确认可用，
 # 返回 data[0].quota 以 region_id 为键，各地域独立计数。
 CHECK_AVAILABLE_PATH = "/dianshi/check-available"
@@ -386,6 +392,7 @@ NO_RETRY_CODES = {
 QUEUE_CODES = {CODE_NOT_STARTED, CODE_RATE_LIMIT, CODE_BUSY, CODE_CONCURRENT, CODE_RATE_LIMIT_API}
 
 CODE_DESC: dict[int | str | None, str] = {
+    "CSRF-ERROR": "CSRF 校验失败：token 与服务端当前 skey 对不上（重新扫码）",
     CODE_NOT_STARTED: "秒杀尚未开始（未到时间或本场已结束）",
     CODE_ALREADY_BOUGHT: "相同实名主体已产生付费，不满足新用户条件（换账号才行）",
     CODE_NO_QUALIFY: "账号不满足本活动参与条件",

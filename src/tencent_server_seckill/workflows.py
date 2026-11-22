@@ -5,12 +5,14 @@ import time
 from datetime import datetime
 
 # 复用核心逻辑
-from .api import qualify_blocked, warmup, warmup_qualify
+from .api import _is_csrf_error, qualify_blocked, warmup, warmup_qualify
 from .browser import (
     CSRF_HOOK_JS,
     UA,
+    apply_stealth,
     async_playwright,
     attach_csrf_sniffer,
+    ensure_csrf,
     launch_browser,
     new_api_context,
 )
@@ -112,9 +114,8 @@ async def run_grab(region_id, target_time=None, rotate=True):
         ctx = await browser.new_context(
             storage_state=str(STATE_PATH), viewport={"width": 1920, "height": 1080}, user_agent=UA
         )
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+        # 反检测交给 playwright-stealth 整套（navigator.webdriver 只是其中一条）
+        await apply_stealth(ctx)
         await ctx.add_init_script(CSRF_HOOK_JS)
         page = await ctx.new_page()
         page.set_default_timeout(30000)
@@ -137,6 +138,14 @@ async def run_grab(region_id, target_time=None, rotate=True):
                 return False
             if state == "ok":
                 log("登录态有效")
+            elif state == "csrf":
+                # CSRF-ERROR = token 与服务端当前 skey 对不上。
+                # 以前这里"按有效继续"，于是后面每个接口都 CSRF-ERROR，
+                # 界面只显示"未识别的返回码"，看不出真正原因。
+                c("登录态 CSRF 校验失败（token 与服务端当前 skey 对不上）。", Fore.RED)
+                c("  这个状态继续跑只会每个接口都报错，请重新扫码。", Fore.WHITE)
+                log(f"登录检查失败（csrf）：{r.get('code') or r.get('__err')}")
+                return False
             else:
                 log(f"登录态未能确认（{state}），按有效继续；真失效会在开抢前复验时报出来")
                 c(f"登录态无法确认（{state}），继续尝试。", Fore.YELLOW)
@@ -246,6 +255,28 @@ async def run_grab(region_id, target_time=None, rotate=True):
                                     f"!! 登录态已失效（{r.get('code') or r.get('__err')}），请中断后重新扫码",
                                     Fore.RED,
                                 )
+                            elif state == "csrf":
+                                # token 与服务端当前 skey 对不上：按当前 skey 重算一次
+                                # 页面 token 再复验，还不行就说明这场的请求全会
+                                # CSRF-ERROR，不如直接停。
+                                log(
+                                    f"登录复验 csrf（{r.get('code')}），按当前 skey 重算 token 再试"
+                                )
+                                await ensure_csrf(page, force=True)
+                                await asyncio.sleep(0.5)
+                                state2, r2 = await verify_state(ctx)
+                                if state2 == "ok":
+                                    log("重算 token 后登录态复验通过")
+                                elif state2 == "csrf":
+                                    c(
+                                        "!! 重算 token 后仍是 CSRF 校验失败，本场中止（"
+                                        "每个请求都会被服务端拒掉）",
+                                        Fore.RED,
+                                    )
+                                    stop_hb["v"] = True
+                                    return False
+                                else:
+                                    log(f"重算 token 后登录复验状态：{state2}")
                             else:
                                 log(f"登录复验未能确认（{state}），继续（不代表登录失效）")
                         except Exception as e:
@@ -377,6 +408,7 @@ async def place_single_order(ctx, goods, preview=0, timeout=20):
 # do-goods 的返回码怎么念给人听。只列实测见过的，其余显示原码让用户带原话反馈。
 GOODS_CODE_DESC = {
     CODE_OK: "下单成功（已建单）",
+    "CSRF-ERROR": "CSRF 校验失败",
     CODE_NOT_STARTED: "秒杀尚未开始（这个商品受时间窗限制）",
     CODE_RATE_LIMIT: "访问频率过快：账号/IP 正在限流，减并发也没用，等 1~2 小时",
     CODE_BUSY: "系统繁忙：服务端在排队",
@@ -434,6 +466,9 @@ async def test_once(region_id):
         if state == "not-logged":
             c(f"  登录态无效（{vr.get('code') or vr.get('__err')}），先扫码登录再试。", Fore.RED)
             return
+        if state == "csrf":
+            log(f"试单已取消：登录态 CSRF 校验失败（code={vr.get('code')}）")
+            return
         if state != "ok":
             c(f"  登录态未能确认（{state}），继续尝试这一条。", Fore.YELLOW)
 
@@ -459,12 +494,31 @@ async def test_once(region_id):
                 timeout=15000,
             )
             pj = await pr.json()
+            if _is_csrf_error(pj):
+                log(f"试单已取消：价格查询 CSRF 校验失败（code={pj.get('code')}）")
+                c(
+                    f"  价格查询被 CSRF 挡下（{pj.get('code')}）：token 与服务端当前 skey 对不上。",
+                    Fore.RED,
+                )
+                c("  这种状态下单也会被拒，先重新扫码再来。", Fore.WHITE)
+                return
+            if pj.get("code") != CODE_OK:
+                c(
+                    f"  价格查询返回 code={pj.get('code')}：{str(pj.get('msg') or '')[:60]}",
+                    Fore.YELLOW,
+                )
             items = (pj.get("data") if isinstance(pj.get("data"), list) else None) or []
             price = next(
                 (x for x in items if int(x.get("act_id") or 0) == int(goods["act_id"])), None
             )
             c(f"  价格: {fmt_price(price)}", Fore.CYAN)
-            if price and price.get("real_cost") != TEST_REAL_COST:
+            if price is None:
+                # 「价格未知」得说清为什么：接口整个没通，还是里面没有这一项
+                c(
+                    f"  价格未知：返回里没有 act_id={goods['act_id']} 这一项（共 {len(items)} 项）。",
+                    Fore.YELLOW,
+                )
+            elif price.get("real_cost") != TEST_REAL_COST:
                 c(
                     f"  注意：不是 109 元那款（实际 {fmt_price(price)}），act_id 可能已变",
                     Fore.RED,

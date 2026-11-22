@@ -22,6 +22,7 @@ from .api import qualify_blocked, warmup, warmup_qualify
 from .browser import (
     CSRF_HOOK_JS,
     _report_state_cookies,
+    apply_stealth,
     async_playwright,
     attach_csrf_sniffer,
     ensure_chromium,
@@ -64,7 +65,8 @@ async def run(target_time=None, test_mode=False):
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         )
 
-    await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    # 反检测交给 playwright-stealth 整套（navigator.webdriver 只是其中一条）
+    await apply_stealth(ctx)
     await ctx.add_init_script(CSRF_HOOK_JS)
     page = await ctx.new_page()
     page.set_default_timeout(30000)

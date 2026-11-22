@@ -2,17 +2,19 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .browser import (
     CSRF_HOOK_JS,
     UA,
+    apply_stealth,
     attach_csrf_sniffer,
     ensure_csrf,
     launch_browser,
     new_api_context,
 )
 from .console import Fore, c, log
-from .settings import ACTIVITY_URL
+from .settings import ACTIVITY_URL, API_HOST
 from .storage import STATE_PATH, _state_missing_skey, _state_summary
 
 VIP_URL = "https://act-api.cloud.tencent.com/user/get-vip-info"
@@ -86,19 +88,83 @@ def gtk_of(skey):
     return str(2147483647 & _i32(int(e)))
 
 
-async def csrf_from_context(ctx):
-    """从 context 的 cookie 里取 skey 现算 csrf，不依赖页面、也不加载页面。"""
-    try:
-        cookies = await ctx.cookies()
-    except Exception:
-        return None
+def _domain_matches(cookie_domain, host):
+    """这条 cookie 会不会被发到 host（RFC 6265 的 domain-match）。
+
+    Playwright 里 domain 带前导点 = 域 cookie（子域也发），不带 = host-only
+    cookie（只发给这个主机本身）。
+    """
+    d = (cookie_domain or "").lstrip(".").lower()
+    h = (host or "").lower()
+    if not d or not h:
+        return False
+    return h == d or h.endswith("." + d)
+
+
+def _pick_skey(cookies, host):
+    """在 cookie 列表里挑出「host 真的会收到」的那条 skey。挑不到返回 None。"""
     for want in ("skey", "p_skey"):
-        for ck in cookies:
-            if ck.get("name") == want and ck.get("value"):
-                tok = gtk_of(ck["value"])
-                if tok:
-                    return tok
+        cands = [
+            c
+            for c in cookies
+            if c.get("name") == want and c.get("value") and _domain_matches(c.get("domain"), host)
+        ]
+        if not cands:
+            continue
+        # 同名多条时：host 精确匹配优先，其次域名最长（最具体）的那条
+        cands.sort(
+            key=lambda c: (
+                0 if (c.get("domain") or "").lstrip(".").lower() == host else 1,
+                -len((c.get("domain") or "").lstrip(".")),
+            )
+        )
+        return cands[0]
     return None
+
+
+async def api_skey(ctx, url=None):
+    """取「API 主机真正会收到」的那条 skey cookie。
+
+    【踩过的坑】.state.json 里同时躺着三条 skey：
+        .qcloud.com         国际站
+        .cloud.tencent.cn   中国站 .cn
+        .cloud.tencent.com  国内主站（act-api.cloud.tencent.com 用的就是它）
+    以前从整个 cookie jar 里取第一条（.qcloud.com）算 csrf，那条 cookie 根本
+    不会发到 act-api.cloud.tencent.com，用它算出来的 token 必然对不上。
+    2026-11-22 实测（同一个 context，只换 skey）：
+        .qcloud.com 那条        -> {"code":"CSRF-ERROR","msg":"CSRF 校验失败"}
+        .cloud.tencent.cn 那条  -> {"code":"CSRF-ERROR","msg":"CSRF 校验失败"}
+        .cloud.tencent.com 那条 -> {"code":0,"msg":"ok"}   <- 只有这条能用
+
+    所以这里按 URL 作用域取：ctx.cookies(url) 只返回浏览器会发给这个 URL 的
+    cookie，跨域的 skey 根本不在列表里。
+    """
+    url = url or VIP_URL
+    host = urlsplit(url).hostname or API_HOST
+    cookies = []
+    try:
+        cookies = await ctx.cookies(url)
+    except Exception:
+        cookies = []
+    if not cookies:
+        # 兜底：老版本 playwright 不支持按 URL 过滤时取全量，后面再按域名筛
+        try:
+            cookies = await ctx.cookies()
+        except Exception:
+            return None
+    return _pick_skey(cookies, host)
+
+
+async def csrf_from_context(ctx, url=None):
+    """从 API 作用域的 skey 现算 csrf，不依赖页面、也不加载页面。
+
+    作用域很重要：全量 cookie jar 里有三条 skey，只有发到 API 主机的
+    那条算出来的 token 服务端才认（详见 api_skey 的注释）。
+    """
+    ck = await api_skey(ctx, url)
+    if not ck:
+        return None
+    return gtk_of(ck.get("value"))
 
 
 async def verify_state(ctx, timeout=15):
@@ -115,9 +181,13 @@ async def verify_state(ctx, timeout=15):
     只打接口则完全不动 cookie（实测前后条数一致）。csrf 用 g_tk(skey) 现算，
     与页面 hook 抓到的值完全一致（同一算法，305 组实测逐位相同）。
     """
-    gtk = await csrf_from_context(ctx)
+    ck = await api_skey(ctx, VIP_URL)
+    if not ck:
+        return "unknown", {"__err": f"context 里没有 {API_HOST} 作用域的 skey"}
+    gtk = gtk_of(ck.get("value"))
     if not gtk:
-        return "unknown", {"__err": "context 里没有 skey"}
+        return "unknown", {"__err": "skey 是空的"}
+    log(f"校验登录态：用 {ck.get('domain')} 的 skey 算 csrf（token={gtk}）")
     try:
         resp = await ctx.request.post(
             VIP_URL,
@@ -128,7 +198,27 @@ async def verify_state(ctx, timeout=15):
         r = await resp.json()
     except Exception as e:
         return "unknown", {"__err": str(e)[:80]}
-    return _login_state(r), r
+    state = _login_state(r)
+    if state == "csrf":
+        # token 与服务端当前 skey 对不上。skey 可能刚换过，按当前值重算一次再试。
+        await asyncio.sleep(0.5)
+        ck2 = await api_skey(ctx, VIP_URL)
+        tok2 = gtk_of(ck2.get("value")) if ck2 else None
+        if tok2 and tok2 != gtk:
+            try:
+                resp2 = await ctx.request.post(
+                    VIP_URL,
+                    data="{}",
+                    headers={"Content-Type": "application/json", "x-csrf-token": tok2},
+                    timeout=int(timeout * 1000),
+                )
+                r2 = await resp2.json()
+            except Exception:
+                r2 = None
+            if r2 is not None:
+                log(f"重算 csrf 后再试一次（token={tok2}）")
+                return _login_state(r2), r2
+    return state, r
 
 
 async def verify_state_file(state_path=None):
@@ -288,7 +378,9 @@ async def _has_login_cookie(ctx):
     却一个 skey 都没有 —— 就是"接口说成功、cookie 没到位"时存下的空壳。
     """
     try:
-        names = {ck.get("name") for ck in await ctx.cookies()}
+        # 只看 API 主机会收到的那批 cookie：别的域名的 skey（比如 .qcloud.com）
+        # 对这个接口不算数，认了也是假登录态
+        names = {ck.get("name") for ck in await ctx.cookies(VIP_URL)}
     except Exception:
         return False, set()
     has = ("skey" in names or "p_skey" in names) and "uin" in names
@@ -329,9 +421,8 @@ async def do_login():
         pw = await async_playwright().start()
         browser = await launch_browser(pw, headless=False)
         ctx = await browser.new_context(viewport={"width": 1400, "height": 900}, user_agent=UA)
-        await ctx.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
+        # 反检测交给 playwright-stealth 整套（navigator.webdriver 只是其中一条）
+        await apply_stealth(ctx)
         await ctx.add_init_script(CSRF_HOOK_JS)
         page = await ctx.new_page()
         page.set_default_timeout(30000)
@@ -503,7 +594,14 @@ async def ensure_login():
     # 加载页面会在登录态失效时把 skey/uin/tinyid 一起清掉（实测 21 条 -> 18 条，
     # 三个全没），等于校验动作本身把登录态毁了，用户只能重扫。
     state, r, cookie_n = await verify_state_file()
-    if state in ("csrf", "unknown"):
+    if state == "csrf":
+        # CSRF-ERROR = 请求带的 token 与服务端当前 skey 对不上。
+        # 这不是「没能确认」，是「确认失败」：以前这里按有效继续，于是后面
+        # 每个接口都 CSRF-ERROR，界面只显示「未识别的返回码」，看不出原因。
+        # 重算一次 token 再试（skey 可能刚换过），还不行就必须重扫。
+        await asyncio.sleep(1.5)
+        state, r, cookie_n = await verify_state_file()
+    elif state == "unknown":
         # 可能是网络抖动或 EdgeOne 挑战，隔几秒再试一次，
         # 否则会误判失效、让人白扫一次码
         await asyncio.sleep(3)
@@ -518,7 +616,18 @@ async def ensure_login():
         log("登录态有效")
         return True
 
-    if state in ("csrf", "unknown"):
+    if state == "csrf":
+        # token 对不上就是不对，别装没事：继续跑只会让每个接口都 CSRF-ERROR
+        log(f"登录态 CSRF 校验失败（服务端返回 {detail or 'CSRF-ERROR'}）")
+        c("登录态 CSRF 校验失败：token 与服务端当前 skey 对不上。", Fore.RED)
+        c("  这种状态继续跑，每个接口都会报 CSRF 错误，请重新扫码一次。", Fore.WHITE)
+        y = input("  现在重新扫码登录？(y/n): ").strip().lower()
+        if y == "y":
+            return await do_login()
+        c("  未登录，操作已取消", Fore.RED)
+        return False
+
+    if state == "unknown":
         # 无法证明失效 -> 不打扰用户，继续干活；真失效的话开抢前那次复验会报出来
         log(f"登录态未能确认（{state}{': ' + detail if detail else ''}），按有效继续")
         c(f"登录态无法确认（{state}），但也不代表失效，继续尝试。", Fore.YELLOW)
